@@ -19,7 +19,7 @@
     - Webhook: ore list + rarity list + mythic+ auto + sound + session stats (ores/gold/hr in watermark)
     - Safety: no hookmetamethod, cloneref, humanized delays, anti-AFK, auto-rejoin, queue_on_teleport, SaveManager
 
-    Usage: loadstring(game:HttpGet("YOUR_RAW_URL"))()
+    Usage: loadstring(game:HttpGet("https://raw.githubusercontent.com/cloudsense-pub/creep-fork/refs/heads/main/Forge_Stealth.lua"))()
 ]]
 
 while not game:IsLoaded() do task.wait(0.1) end
@@ -162,7 +162,7 @@ getgenv().ForgeFlags = getgenv().ForgeFlags or {
     webhook_include_jobid = true,
     reconnect_on_kick = true,
     max_reconnects = 3,
-    loader_url = "",
+    loader_url = "https://raw.githubusercontent.com/cloudsense-pub/creep-fork/refs/heads/main/Forge_Stealth.lua",
 }
 local ForgeFlags = getgenv().ForgeFlags
 getgenv().forge_current_tween = getgenv().forge_current_tween or false
