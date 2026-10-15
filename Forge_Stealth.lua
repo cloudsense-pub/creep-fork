@@ -44,6 +44,31 @@ local GuiSvc = cloneref(game:GetService("GuiService"))
 local LocalPlayer = PlayersSvc.LocalPlayer
 local Camera = WS.CurrentCamera
 
+--// executor-safe globals (nil on some executors - never call bare)
+local ReqFn = http_request or request or HttpPost or (syn and syn.request) or (http and http.request) or (fluxus and fluxus.request)
+local FirePromptFn = fireproximityprompt
+local SetClipboardFn = setclipboard
+local function HttpGetStr(url)
+    if ReqFn then
+        local ok, res = pcall(function() return ReqFn({Url = url, Method = "GET"}) end)
+        if ok and res then
+            if type(res) == "table" and type(res.Body) == "string" then return res.Body end
+            if type(res) == "string" then return res end
+        end
+    end
+    local hg = game.HttpGet
+    if hg then
+        local ok, res = pcall(function() return game:HttpGet(url) end)
+        if ok and type(res) == "string" then return res end
+    end
+    local hga = game.HttpGetAsync
+    if hga then
+        local ok, res = pcall(function() return game:HttpGetAsync(url) end)
+        if ok and type(res) == "string" then return res end
+    end
+    return nil
+end
+
 --// flags (Ather-like)
 getgenv().ForgeFlags = getgenv().ForgeFlags or {
     tweenspeed = 35,
@@ -1264,7 +1289,11 @@ FarmRight:AddButton('Refresh NPCs', function() if Options.MobSelect then Options
 -- Filters
 FiltOre:AddDropdown('RaritySelect', {Text='Select Rarity (empty = ALL) - skips others', Default={}, Multi=true, Values=RARITY_ORDER, Callback=function(v) ForgeFlags.rarities_selected = DropToArray(v) end})
 FiltOre:AddToggle('SkipClaimed', {Text='Skip Claimed (Someone) Rocks', Default=ForgeFlags.skip_claimed, Callback=function(v) ForgeFlags.skip_claimed=v end})
-FiltOre:AddLabel('How skip works:\n- Claimed/Dead/NoHitbox = skip\n- Ore name not in list = skip\n- Rarity not in list = skip\n- Else mine by Priority then Distance', true)
+FiltOre:AddLabel('How skip works:')
+FiltOre:AddLabel('- Claimed/Dead/NoHitbox = skip')
+FiltOre:AddLabel('- Ore name not in list = skip')
+FiltOre:AddLabel('- Rarity not in list = skip')
+FiltOre:AddLabel('- Else Priority then Distance')
 -- Priority sliders (build dynamically, max 15 most common to avoid UI spam + button for rest)
 do
     local ores = GetOreList()
@@ -1282,7 +1311,8 @@ do
             Options[key].Callback = function(v) ForgeFlags.ore_priority[nm]=v end
         end
     end
-    FiltPrio:AddLabel('Top 20 shown. All ores default 0.\nSet higher (e.g Diamond 10) to farm first.', true)
+    FiltPrio:AddLabel('Top 20 shown. Default 0.')
+    FiltPrio:AddLabel('Set higher to farm first.')
 end
 
 -- Forge tab
@@ -1301,7 +1331,8 @@ ForgeMelt:AddToggle('AutoPour', {Text='Auto Pour', Default=false, Callback=funct
 ForgeMelt:AddSlider('PourSens', {Text='Pour Sensitivity', Default=ForgeFlags.poursens, Min=0, Max=0.1, Rounding=3, Callback=function(v) ForgeFlags.poursens=v end})
 ForgeHammer:AddToggle('AutoHammer', {Text='Auto Hammer (perfect ~0.53)', Default=false, Callback=function(v) ForgeFlags.autohammer=v end})
 ForgeHammer:AddToggle('AutoMold', {Text='Auto Mold (click mold)', Default=false, Callback=function(v) ForgeFlags.automold=v end})
-ForgeHammer:AddLabel('Requires VirtualInputManager.\nIf executor blocks VIM, forge\ntoggles will notify.', true)
+ForgeHammer:AddLabel('Needs VirtualInputManager.')
+ForgeHammer:AddLabel('If VIM blocked, use Instant Forge.')
 
 -- forge loops (humanized VIM, same logic as LazyHub but jittered)
 do
@@ -1576,15 +1607,18 @@ PlrTP:AddDropdown('IslandTP', {Text='Teleport: Any Island (works any world)', De
     local s = DropSingle(v, nil)
     if s and TeleportRF then pcall(function() TeleportRF:InvokeServer(s) end) end
 end})
-PlrTP:AddLabel('W3 needs lvl 70, W4 lvl 100.\nServer validates reqs.', true)
+PlrTP:AddLabel('W3 needs lvl 70, W4 lvl 100.')
 PlrTP:AddButton('Server Hop (smallest)', function()
+    local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100", game.PlaceId)
+    local res = HttpGetStr(url)
+    if not res then pcall(function() Creep:Notify("Server hop: HTTP failed on this executor", 4) end) return end
     pcall(function()
-        local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100", game.PlaceId)
-        local res = game:HttpGet(url)
         local data = HttpSvc:JSONDecode(res)
         if data and data.data and #data.data>0 then
             table.sort(data.data, function(a,b) return (a.playing or 99)<(b.playing or 99) end)
             TeleportSvc:TeleportToPlaceInstance(game.PlaceId, data.data[1].id, LocalPlayer)
+        else
+            Creep:Notify("Server hop: no servers returned", 4)
         end
     end)
 end)
@@ -1619,7 +1653,8 @@ WhTest:AddButton('Send Status Now', function()
     local profit = g - (ForgeFlags.session_gold_start or 0)
     SendWebhook("Status :bar_chart:", string.format("Player: %s\nLevel: %d\nGold: %d (%+d session)\nOres: %d\nQuest: %s\nPlace: %d\nJobId: %s", LocalPlayer.Name, PlayerLevel(), g, profit, OresMinedSession, tostring(getgenv().forge_current_quest or "none"), game.PlaceId, game.JobId), true)
 end)
-WhTest:AddLabel('Ather parity:\n- Ores (name+rarity)\n- Quest complete\n- Level up\n- Status heartbeat', true)
+WhTest:AddLabel('Notifies: ores, quests, levels.')
+WhTest:AddLabel('Status heartbeat if enabled.')
 
 --// ===== EVERYTHING PACK (combat / auto / visuals / server) =====
 -- rock-type filter wrapper (extends RockPassesFilter defined above)
@@ -1837,7 +1872,8 @@ local QuestESPFolder = nil
 -- Filters: rock type
 FiltRock:AddDropdown('RockTypeSelect', {Text='Select Rock Type (empty=ALL)', Default={}, Multi=true, Values=GetRockTypeList(), Callback=function(v) ForgeFlags.rocktypes_selected = DropToArray(v) end})
 FiltRock:AddButton('Refresh Rock Types', function() if Options.RockTypeSelect then Options.RockTypeSelect:SetValues(GetRockTypeList()) end end)
-FiltRock:AddLabel('Example: Basalt Vein, Volcanic Rock,\nLarge Ice Crystal, Spirit Rock.\nSkips all other rock models.', true)
+FiltRock:AddLabel('E.g. Basalt Vein, Volcanic Rock.')
+FiltRock:AddLabel('Skips all other rock models.')
 
 -- Farm stats
 FarmStats:AddLabel('Tracking gold + ores this session.')
@@ -1868,15 +1904,18 @@ CombatHit:AddToggle('HitExpand', {Text='Expand Mob Hitbox (client)', Default=fal
     end
 end})
 CombatHit:AddSlider('HitSize', {Text='Hitbox Size', Default=ForgeFlags.hitbox_size, Min=4, Max=20, Rounding=0, Callback=function(v) ForgeFlags.hitbox_size = v end})
-CombatHit:AddLabel('Risky: visible to others if\ntransparency glitches. Client only.', true)
+CombatHit:AddLabel('Client only. May look odd')
+CombatHit:AddLabel('to others if it glitches.')
 CombatBoss:AddToggle('BossFarm', {Text='Prioritize Bosses', Default=false, Callback=function(v) ForgeFlags.boss_farm = v end})
-CombatBoss:AddLabel('Boss = name has Boss/Golem/\nAsura or HP > 5000. Works with\nSelected + Closest mob farm.', true)
+CombatBoss:AddLabel('Boss = name has Boss/Golem')
+CombatBoss:AddLabel('or HP over 5000.')
 
 -- Loot recycle/enhance (safe: VIM click fallback + direct service pcall)
 LootRecycle:AddDropdown('RecycleRar', {Text='Recycle Rarities (weapons/armor)', Default={}, Multi=true, Values=RARITY_ORDER, Callback=function(v) ForgeFlags.recycle_rarities = DropToArray(v) end})
 LootRecycle:AddToggle('AutoRecycle', {Text='Auto Recycle (low rarity)', Default=false, Callback=function(v) ForgeFlags.auto_recycle = v end})
 LootRecycle:AddToggle('AutoEnhance', {Text='Auto Enhance Selected (EnhanceService)', Default=false, Callback=function(v) ForgeFlags.auto_enhance = v end})
-LootRecycle:AddLabel('Recycle/enhance use official\nservices via pcall. If game\nrenamed them, it safely skips.', true)
+LootRecycle:AddLabel('Uses official services.')
+LootRecycle:AddLabel('Skips safely if renamed.')
 
 -- Auto tab
 -- Auto tab: quests (Ather parity - start / farm / turn-in)
@@ -1902,7 +1941,10 @@ AutoQuest:AddButton('TP To Current Quest NPC', function()
         if m then StealthMove(m:GetPivot(), true) end
     end
 end)
-AutoQuest:AddLabel('How it works:\n- Accept: walks to Npc + Dialogue\n  + GiveQuest\n- Kill/Mine/Collect: auto-sets\n  mob/ore/rock filters + farms\n- Talk: walks + talks to turn in\n- Board: claims QuestBoard tiers', true)
+AutoQuest:AddLabel('Accept: walks to NPC + talks.')
+AutoQuest:AddLabel('Objectives: auto-sets filters.')
+AutoQuest:AddLabel('Talk: walks over to turn in.')
+AutoQuest:AddLabel('Board: claims QuestBoard tiers.')
 AutoQuest:AddToggle('AutoDaily', {Text='Auto Claim Daily Login', Default=false, Callback=function(v) ForgeFlags.auto_daily = v end})
 AutoQuest:AddToggle('AutoMail', {Text='Auto Claim Mailbox', Default=false, Callback=function(v) ForgeFlags.auto_mail = v end})
 AutoQuest:AddToggle('AutoQuestOld', {Text='Auto Talk QuestBoard NPC', Default=false, Callback=function(v) ForgeFlags.auto_quest = v end})
@@ -1979,8 +2021,8 @@ VisPerf:AddSlider('FOV', {Text='Camera FOV', Default=70, Min=40, Max=120, Roundi
 VisPerf:AddToggle('HidePlayers', {Text='Hide Other Players', Default=false, Callback=function(v) ForgeFlags.hide_players = v end})
 
 -- Server
-SrvMain:AddButton('Copy JobId', function() if setclipboard then setclipboard(game.JobId) end end)
-SrvMain:AddButton('Copy PlaceId', function() if setclipboard then setclipboard(tostring(game.PlaceId)) end end)
+SrvMain:AddButton('Copy JobId', function() if SetClipboardFn then SetClipboardFn(game.JobId) else pcall(function() Creep:Notify("No clipboard on this executor", 3) end) end end)
+SrvMain:AddButton('Copy PlaceId', function() if SetClipboardFn then SetClipboardFn(tostring(game.PlaceId)) else pcall(function() Creep:Notify("No clipboard on this executor", 3) end) end end)
 SrvMain:AddDropdown('PlayerTP', {Text='Teleport To Player', Default=nil, AllowNull=true, SpecialType='Player', ExcludeLocalPlayer=true, Callback=function(v)
     local name = DropSingle(v, nil)
     local plr = name and PlayersSvc:FindFirstChild(name)
@@ -2088,7 +2130,8 @@ end
 -- Forge auto cycle
 ForgeAuto:AddToggle('AutoForgeCycle', {Text='Auto Go To Forge + Start', Default=false, Callback=function(v) ForgeFlags.auto_forge_cycle = v end})
 ForgeAuto:AddInput('MoldName', {Text='Mold / Item Name (optional)', Default="", Placeholder='e.g. Dagger', Finished=true, Callback=function(v) ForgeFlags.forge_mold_name = v end})
-ForgeAuto:AddLabel('Walks to Forge prompt and\nfires it. Then use Melt/Pour/\nHammer/Mold toggles.', true)
+ForgeAuto:AddLabel('Walks to Forge + fires prompt.')
+ForgeAuto:AddLabel('Then use Melt/Pour/Hammer.')
 ForgeAuto:AddToggle('InstantForge', {Text='Instant Forge (try skip, no pass)', Default=false, Callback=function(v)
     ForgeFlags.instant_forge = v
     pcall(function()
@@ -2136,7 +2179,9 @@ ForgeAuto:AddToggle('InstantForge', {Text='Instant Forge (try skip, no pass)', D
         end
     end)
 end})
-ForgeAuto:AddLabel('How skip works:\n- Sets Forge.FastForge=true\n  in Melt request\n- Instants Melt/Pour Start\n  to 0.5s perfect\n- If server checks pass,\n  falls back to VIM play.', true)
+ForgeAuto:AddLabel('Tries FastForge flag skip.')
+ForgeAuto:AddLabel('Else perfect 0.5s play.')
+ForgeAuto:AddLabel('Falls back to VIM play.')
 
 -- loops for everything pack
 task.spawn(function()
@@ -2381,14 +2426,14 @@ task.spawn(function()
         end) end
         if ForgeFlags.auto_hop_timed and tick() - hopStart > ForgeFlags.hop_interval * 60 then
             hopStart = tick()
-            pcall(function()
-                local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100", game.PlaceId)
-                local res = game:HttpGet(url)
+            local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100", game.PlaceId)
+            local res = HttpGetStr(url)
+            if res then pcall(function()
                 local data = HttpSvc:JSONDecode(res)
                 if data and data.data and #data.data > 0 then
                     TeleportSvc:TeleportToPlaceInstance(game.PlaceId, data.data[1].id, LocalPlayer)
                 end
-            end)
+            end) end
         end
         if ForgeFlags.auto_forge_cycle then pcall(function()
             local f = WS:FindFirstChild("Proximity") and WS.Proximity:FindFirstChild("Forge")
@@ -2398,7 +2443,7 @@ task.spawn(function()
                     StealthMove(f:GetPivot(), true)
                 elseif ok then
                     local pp = f:FindFirstChildWhichIsA("ProximityPrompt", true)
-                    if pp then pcall(function() fireproximityprompt(pp) end) end
+                    if pp and FirePromptFn then pcall(function() FirePromptFn(pp) end) end
                 end
             end
         end) end
