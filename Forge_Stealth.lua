@@ -116,6 +116,18 @@ getgenv().ForgeFlags = getgenv().ForgeFlags or {
     staff_names = "",
     alert_any_player = false,
     auto_pickaxe = false,
+    mob_region_only = false,
+    mob_region_center = nil,
+    mob_region_radius = 150,
+    mob_max_dist = 0,
+    ore_max_dist = 0,
+    boss_only = false,
+    aura_selected_only = false,
+    potion_hp = 100,
+    pause_near = false,
+    pause_radius = 40,
+    hop_dead = false,
+    dead_mins = 5,
     webhook_enabled = false,
     webhook_url = "",
     webhook_ores_selected = {},
@@ -143,6 +155,9 @@ getgenv().ForgeFlags = getgenv().ForgeFlags or {
     player_esp = false,
     esp_show_hp = true,
     fullbright = false,
+    steady_cam = true,
+    safespot = true,
+    safespot_dist = 8,
     fps_boost = false,
     hide_players = false,
     fov_value = 70,
@@ -174,6 +189,7 @@ getgenv().ForgeFlags = getgenv().ForgeFlags or {
     -- quest farm (Ather parity)
     quest_mode = "Off",
     quests_selected = {},
+    quests_accept = {},
     auto_accept_quests = false,
     auto_turnin_quests = false,
     auto_farm_objectives = false,
@@ -603,7 +619,8 @@ local function FindBestRock(filterSelected)
                 local prio = RockPriority(mdl)
                 local d = myPos - hb.Position
                 local dsq = d.X*d.X + d.Y*d.Y + d.Z*d.Z
-                if prio > bestPrio or (prio == bestPrio and dsq < bestDistSq) then
+                local tooFar = ForgeFlags.ore_max_dist and ForgeFlags.ore_max_dist > 0 and dsq > ForgeFlags.ore_max_dist * ForgeFlags.ore_max_dist
+                if not tooFar and (prio > bestPrio or (prio == bestPrio and dsq < bestDistSq)) then
                     bestPrio = prio
                     bestDistSq = dsq
                     best = mdl
@@ -634,7 +651,8 @@ local function FindBestRockInRegion(regionName)
                         local prio = RockPriority(mdl)
                         local d = myPos - hb.Position
                         local dsq = d.X*d.X + d.Y*d.Y + d.Z*d.Z
-                        if prio > bestPrio or (prio == bestPrio and dsq < bestDistSq) then
+                        local tooFar = ForgeFlags.ore_max_dist and ForgeFlags.ore_max_dist > 0 and dsq > ForgeFlags.ore_max_dist * ForgeFlags.ore_max_dist
+                        if not tooFar and (prio > bestPrio or (prio == bestPrio and dsq < bestDistSq)) then
                             bestPrio, bestDistSq, best = prio, dsq, mdl
                         end
                     end
@@ -705,6 +723,49 @@ local function DoResetTeleport(targetCF)
     return sawCountdown
 end
 
+--// mob scope helpers (above StealthMove: it pauses travel near players)
+local function IsBossModel(m)
+    if not m then return false end
+    local n = m.Name:lower()
+    if n:find("boss") or n:find("golem") or n:find("asura") then return true end
+    local h = m:FindFirstChildOfClass("Humanoid")
+    if h and h.MaxHealth and h.MaxHealth > 5000 then return true end
+    return false
+end
+local function MobInScope(m, root, myPos)
+    if ForgeFlags.boss_only and not IsBossModel(m) then return false end
+    local d = (myPos - root.Position).Magnitude
+    if ForgeFlags.mob_max_dist and ForgeFlags.mob_max_dist > 0 and d > ForgeFlags.mob_max_dist then return false end
+    if ForgeFlags.mob_region_only and ForgeFlags.mob_region_center then
+        local dd = root.Position - ForgeFlags.mob_region_center
+        if math.sqrt(dd.X*dd.X + dd.Z*dd.Z) > (ForgeFlags.mob_region_radius or 150) then return false end
+    end
+    return true
+end
+local function PlayerNearby(myPos, r)
+    for _, p in ipairs(PlayersSvc:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            local hr = p.Character:FindFirstChild("HumanoidRootPart")
+            if hr and (myPos - hr.Position).Magnitude <= r then return true end
+        end
+    end
+    return false
+end
+-- one stable offset per target: rewriting an identical CFrame is harmless,
+-- re-rolling jitter every call is what vibrates the model (and camera)
+local function SnapCFrame(goal, target, targetCF, targetPos)
+    local skey = nil
+    pcall(function()
+        if typeof(target) == "Instance" then skey = target:GetDebugId()
+        elseif targetCF then skey = tostring(targetCF)
+        else skey = tostring(targetPos) end
+    end)
+    if getgenv().forge_snapKey ~= skey then
+        getgenv().forge_snapKey = skey
+        getgenv().forge_snapOff = JitterVec(0.35)
+    end
+    return goal + (getgenv().forge_snapOff or Vector3.new())
+end
 local function StealthMove(target, isCFrameOverride)
     if getgenv().forge_current_tween or getgenv().forge_isTeleporting then return end
     local targetPos, targetCF
@@ -722,7 +783,8 @@ local function StealthMove(target, isCFrameOverride)
     end
     local ok, _, _, hrp = GetChar()
     if not ok then return end
-    targetPos = targetPos + JitterVec(0.25)
+    -- anti-report pause: don't travel while another player is close
+    if ForgeFlags.pause_near and PlayerNearby(hrp.Position, ForgeFlags.pause_radius or 40) then return end
 
     local dist = (hrp.Position - targetPos).Magnitude
     local flat = Vector3.new(hrp.Position.X - targetPos.X, 0, hrp.Position.Z - targetPos.Z).Magnitude
@@ -731,22 +793,28 @@ local function StealthMove(target, isCFrameOverride)
     -- snap if very close (farm position)
     if flat <= 11 and farming and not isCFrameOverride then
         local d = ForgeFlags.distance
+        if ForgeFlags.safespot and (ForgeFlags.mob_autofarm or ForgeFlags.mob_closestfarm) then
+            -- safespot: own offset for mobs so hits land but theirs don't
+            d = (d < 0 and -1 or 1) * (ForgeFlags.safespot_dist or 8)
+        end
         if d == 0 then d = 1 end
         local goal
         if ForgeFlags.farmmethod == "Above/Below" then
-            goal = CFrame.new(targetPos + Vector3.new(0, d, 0) + JitterVec(0.2), targetPos)
+            goal = CFrame.new(targetPos + Vector3.new(0, d, 0), targetPos)
         else
             local look = (targetCF and targetCF.LookVector) or (targetPos - hrp.Position).Unit
-            goal = CFrame.new(targetPos + look * d + JitterVec(0.2), targetPos)
+            goal = CFrame.new(targetPos + look * d, targetPos)
         end
-        hrp.CFrame = goal
+        hrp.CFrame = SnapCFrame(goal, target, targetCF, targetPos)
         hrp.Velocity = Vector3.new()
         hrp.RotVelocity = Vector3.new()
+        getgenv().forge_facePos = targetPos
         if ForgeFlags.mob_autofarm or ForgeFlags.mob_closestfarm then getgenv().forge_npcfound = true
         else getgenv().forge_orefound = true end
         return
     end
     if dist > 11 then
+        getgenv().forge_snapKey = nil
         if (ForgeFlags.mob_autofarm or ForgeFlags.mob_closestfarm) and getgenv().forge_npcfound then getgenv().forge_npcfound = false end
         if (ForgeFlags.ore_autofarm or ForgeFlags.ore_closestfarm or ForgeFlags.regional_ore_farm) and getgenv().forge_orefound then getgenv().forge_orefound = false end
     end
@@ -772,6 +840,7 @@ local function StealthMove(target, isCFrameOverride)
     hrp = hrpR
     local start = hrp.Position
     local delta = targetPos - start
+    local flightOff = JitterVec(0.5)
     local t0 = tick()
     local checks = 0
     local distSq = dist*dist
@@ -787,7 +856,13 @@ local function StealthMove(target, isCFrameOverride)
         local goalPos = ForgeFlags.underground_tween and Vector3.new(cur.X, cur.Y - 10, cur.Z) or cur
         hrp.Velocity = Vector3.new()
         hrp.RotVelocity = Vector3.new()
-        hrp.CFrame = CFrame.new(goalPos + JitterVec(0.08))
+        -- face travel direction (level): no moonwalking, looks human
+        local toT = Vector3.new(targetPos.X - goalPos.X, 0, targetPos.Z - goalPos.Z)
+        if toT.Magnitude > 0.5 then
+            hrp.CFrame = CFrame.lookAt(goalPos + flightOff, Vector3.new(targetPos.X, goalPos.Y, targetPos.Z))
+        else
+            hrp.CFrame = CFrame.new(goalPos + flightOff)
+        end
         checks = checks + 1
         if checks >= 5 then
             local dd = (cur - targetPos)
@@ -802,6 +877,9 @@ local function StealthMove(target, isCFrameOverride)
     getgenv().forge_current_tween = false
     if keep and flatLeft <= 11 then
         local d = ForgeFlags.distance
+        if ForgeFlags.safespot and (ForgeFlags.mob_autofarm or ForgeFlags.mob_closestfarm) then
+            d = (d < 0 and -1 or 1) * (ForgeFlags.safespot_dist or 8)
+        end
         if d == 0 then d = 1 end
         local goal
         if ForgeFlags.farmmethod == "Above/Below" then
@@ -810,8 +888,9 @@ local function StealthMove(target, isCFrameOverride)
             local look = (targetCF and targetCF.LookVector) or (targetPos - hrp.Position).Unit
             goal = CFrame.new(targetPos + look * d, targetPos)
         end
-        hrp.CFrame = goal + JitterVec(0.15)
+        hrp.CFrame = SnapCFrame(goal, target, targetCF, targetPos)
         hrp.Velocity = Vector3.new()
+        getgenv().forge_facePos = targetPos
         if not isCFrameOverride then
             if ForgeFlags.mob_autofarm or ForgeFlags.mob_closestfarm then getgenv().forge_npcfound = true
             else getgenv().forge_orefound = true end
@@ -828,12 +907,14 @@ local function FindSelectedMob()
     local best, bd = nil, math.huge
     for _, m in ipairs(Living:GetChildren()) do
         local base = BaseName(m.Name)
-        local sel = false
-        for _, s in ipairs(ForgeFlags.mobs_selected) do if base == s then sel = true break end end
+        local sel = ForgeFlags.boss_only
+        if not sel then
+            for _, s in ipairs(ForgeFlags.mobs_selected) do if base == s then sel = true break end end
+        end
         if sel then
             local root = m:FindFirstChild("HumanoidRootPart")
             local hum = m:FindFirstChildOfClass("Humanoid")
-            if root and hum and hum.Health > 0 then
+            if root and hum and hum.Health > 0 and MobInScope(m, root, my) then
                 local d = (my - root.Position).Magnitude
                 if d < bd then bd, best = d, m end
             end
@@ -851,7 +932,7 @@ local function FindClosestMob()
         local root = m:FindFirstChild("HumanoidRootPart")
         local hum = m:FindFirstChildOfClass("Humanoid")
         local head = m:FindFirstChild("Head")
-        if root and hum and head and hum.Health > 0 and m:GetAttribute("IsNpc") then
+        if root and hum and head and hum.Health > 0 and m:GetAttribute("IsNpc") and MobInScope(m, root, my) then
             local d = (my - root.Position).Magnitude
             if d < bd then bd, best = d, m end
         end
@@ -904,6 +985,7 @@ local function MobLoopSelected()
     if r then
         getgenv().forge_lockInfo.model = m
         getgenv().forge_lockInfo.untilT = os.clock() + LOCK_KEEP
+        getgenv().forge_lastMobTime = tick()
         StealthMove(r)
     end
 end
@@ -926,7 +1008,7 @@ local function MobLoopClosest()
     end
     if not target then getgenv().forge_npcfound = false return end
     local r = target:FindFirstChild("HumanoidRootPart")
-    if r then StealthMove(r) else getgenv().forge_npcfound = false end
+    if r then getgenv().forge_lastMobTime = tick() StealthMove(r) else getgenv().forge_npcfound = false end
     if getgenv().forge_lockInfo.model and not ValidLock(getgenv().forge_lockInfo.model) then
         getgenv().forge_lockInfo.model, getgenv().forge_lockInfo.untilT = nil, 0
     end
@@ -935,6 +1017,11 @@ end
 --// auto mine (humanized, no hooks)
 task.spawn(function()
     while task.wait(math.max(ForgeFlags.mine_delay or 0.15, (ForgeFlags.humanized and 0.14 or 0)) + math.random()*0.05) do
+        -- anti-report pause: hold swings while another player is close
+        if ForgeFlags.pause_near then
+            local okP, _, _, hrP = GetChar()
+            if okP and PlayerNearby(hrP.Position, ForgeFlags.pause_radius or 40) then continue end
+        end
         local npc = getgenv().forge_npcfound and (ForgeFlags.mob_autofarm or ForgeFlags.mob_closestfarm)
         local ore = getgenv().forge_orefound and (ForgeFlags.ore_autofarm or ForgeFlags.ore_closestfarm or ForgeFlags.regional_ore_farm)
         if npc then
@@ -982,6 +1069,26 @@ task.spawn(function()
     end
 end)
 
+--// face target upkeep: re-aim at the live target pos while in range
+-- (mobs walk, so arrival aim goes stale). Throttled + deadband so the
+-- camera doesn't micro-jitter. Level only, no tilt.
+RunSvc.Heartbeat:Connect(function()
+    local fp = getgenv().forge_facePos
+    if not fp then return end
+    if getgenv().forge_current_tween or getgenv().forge_isTeleporting then return end
+    if not (getgenv().forge_orefound or getgenv().forge_npcfound) then getgenv().forge_facePos = nil return end
+    if tick() - (getgenv().forge_lastFace or 0) < 0.12 then return end
+    local ok, _, _, hrp = GetChar()
+    if not ok then return end
+    local want = Vector3.new(fp.X - hrp.Position.X, 0, fp.Z - hrp.Position.Z)
+    if want.Magnitude > 16 or want.Magnitude < 0.5 then return end
+    local cur = hrp.CFrame.LookVector
+    cur = Vector3.new(cur.X, 0, cur.Z)
+    if cur.Magnitude > 0.01 and (cur.Unit - want.Unit).Magnitude < 0.1 then return end
+    getgenv().forge_lastFace = tick()
+    hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(fp.X, hrp.Position.Y, fp.Z))
+end)
+
 --// tween watchdog: a tween stuck >30s halts ALL farming, so force-clear it
 task.spawn(function()
     local since = nil
@@ -992,10 +1099,75 @@ task.spawn(function()
                 getgenv().forge_current_tween = false
                 getgenv().forge_isTeleporting = false
                 since = nil
+                -- adapt: slow the tween down after a stall (min 20)
+                if ForgeFlags.tweenspeed and ForgeFlags.tweenspeed > 20 then
+                    ForgeFlags.tweenspeed = ForgeFlags.tweenspeed - 5
+                    if Options.TweenSpeed then pcall(function() Options.TweenSpeed:SetValue(ForgeFlags.tweenspeed) end) end
+                end
                 pcall(function() Creep:Notify("Tween watchdog: unstuck", 3) end)
             end
         else
             since = nil
+        end
+    end
+end)
+
+--// safespot AI: learns the range where your hits land but theirs don't.
+-- Watches locked mob HP vs own HP: taking damage backs off (+1, max 14),
+-- 6s of no damage dealt creeps closer (min 4). Slider mirrors live value.
+task.spawn(function()
+    local lastMobHp, lastOwnHp, stillSince = nil, nil, tick()
+    while task.wait(1) do
+        if not ForgeFlags.safespot or not getgenv().forge_npcfound then
+            lastMobHp, lastOwnHp, stillSince = nil, nil, tick()
+        else
+            local m = getgenv().forge_lockInfo.model
+            if m and m.Parent then
+                local mh = m:FindFirstChildOfClass("Humanoid")
+                local ok, _, oh = GetChar()
+                if mh and ok and oh then
+                    local mhp, ohp, omax = mh.Health, oh.Health, oh.MaxHealth
+                    if lastMobHp and lastOwnHp then
+                        if ohp < lastOwnHp - math.max(omax * 0.03, 1) then
+                            ForgeFlags.safespot_dist = math.min((ForgeFlags.safespot_dist or 8) + 1, 14)
+                            if Options.SafespotDist then pcall(function() Options.SafespotDist:SetValue(ForgeFlags.safespot_dist) end) end
+                            stillSince = tick()
+                        elseif mhp < lastMobHp then
+                            stillSince = tick()
+                        elseif tick() - stillSince > 6 and (ForgeFlags.safespot_dist or 8) > 4 then
+                            ForgeFlags.safespot_dist = ForgeFlags.safespot_dist - 1
+                            if Options.SafespotDist then pcall(function() Options.SafespotDist:SetValue(ForgeFlags.safespot_dist) end) end
+                            stillSince = tick()
+                        end
+                    end
+                    lastMobHp, lastOwnHp = mhp, ohp
+                end
+            else
+                lastMobHp, lastOwnHp = nil, nil
+            end
+        end
+    end
+end)
+
+--// hop if the server goes dead (no target found for N min while farming)
+task.spawn(function()
+    while task.wait(10) do
+        if ForgeFlags.hop_dead and (ForgeFlags.ore_autofarm or ForgeFlags.ore_closestfarm or ForgeFlags.regional_ore_farm or ForgeFlags.mob_autofarm or ForgeFlags.mob_closestfarm) then
+            local lastFind = math.max(getgenv().forge_lastOreTime or 0, getgenv().forge_lastMobTime or 0)
+            if lastFind > 0 and tick() - lastFind > (ForgeFlags.dead_mins or 5) * 60 then
+                getgenv().forge_lastOreTime = tick()
+                getgenv().forge_lastMobTime = tick()
+                local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100", game.PlaceId)
+                local res = HttpGetStr(url)
+                if res then pcall(function()
+                    local data = HttpSvc:JSONDecode(res)
+                    if data and data.data and #data.data > 0 then
+                        table.sort(data.data, function(a, b) return (a.playing or 99) < (b.playing or 99) end)
+                        SaveCfgNow() ArmQueue()
+                        TeleportSvc:TeleportToPlaceInstance(game.PlaceId, data.data[1].id, LocalPlayer)
+                    end
+                end) end
+            end
         end
     end
 end)
@@ -1114,6 +1286,7 @@ local function SaveFarming() return {mob_autofarm=ForgeFlags.mob_autofarm, mob_c
 local function DisableFarming()
     ForgeFlags.mob_autofarm=false ForgeFlags.mob_closestfarm=false ForgeFlags.ore_autofarm=false ForgeFlags.ore_closestfarm=false ForgeFlags.regional_ore_farm=false
     getgenv().forge_current_tween=false getgenv().forge_isTeleporting=false getgenv().forge_npcfound=false getgenv().forge_orefound=false
+    getgenv().forge_snapKey=nil getgenv().forge_facePos=nil
     if Toggles.MobFarm then Toggles.MobFarm:SetValue(false) end
     if Toggles.ClosestMob then Toggles.ClosestMob:SetValue(false) end
     if Toggles.OreFarm then Toggles.OreFarm:SetValue(false) end
@@ -1303,6 +1476,7 @@ FarmLeft:AddButton('Cancel Tween', function()
     getgenv().forge_current_tween=false getgenv().forge_isTeleporting=false
     local ok,_,_,hrp = GetChar() if ok then hrp.Velocity=Vector3.new(0,0,0) end
 end)
+FarmLeft:AddSlider('OreMaxDist', {Text='Max Distance (0=off)', Default=0, Min=0, Max=3000, Rounding=0, Suffix=' studs', Callback=function(v) ForgeFlags.ore_max_dist=v end})
 
 -- Mob farm
 local mobList = GetMobList()
@@ -1318,6 +1492,20 @@ FarmRight:AddToggle('ClosestMob', {Text='Farm Closest NPC', Default=false, Callb
     task.spawn(function() while ForgeFlags.mob_closestfarm do task.wait(0.1) pcall(MobLoopClosest) end end)
 end})
 FarmRight:AddButton('Refresh NPCs', function() if Options.MobSelect then Options.MobSelect:SetValues(GetMobList()) end end)
+FarmRight:AddToggle('BossOnly', {Text='Bosses Only', Default=false, Callback=function(v) ForgeFlags.boss_only=v end})
+FarmRight:AddToggle('MobRegion', {Text='Only Mobs In Region', Default=false, Callback=function(v) ForgeFlags.mob_region_only=v end})
+FarmRight:AddSlider('MobRadius', {Text='Region Radius', Default=150, Min=30, Max=600, Rounding=0, Suffix=' studs', Callback=function(v) ForgeFlags.mob_region_radius=v end})
+FarmRight:AddButton('Set Region Center Here', function()
+    local ok, _, _, hrp = GetChar()
+    if ok then ForgeFlags.mob_region_center = hrp.Position pcall(function() Creep:Notify("Mob region center set", 3) end) end
+end)
+FarmRight:AddButton('Clear Region', function()
+    ForgeFlags.mob_region_center = nil ForgeFlags.mob_region_only = false
+    if Toggles.MobRegion then pcall(function() Toggles.MobRegion:SetValue(false) end) end
+end)
+FarmRight:AddSlider('MobMaxDist', {Text='Max Distance (0=off)', Default=0, Min=0, Max=2000, Rounding=0, Suffix=' studs', Callback=function(v) ForgeFlags.mob_max_dist=v end})
+FarmRight:AddToggle('Safespot', {Text='Safespot AI (adapt range)', Default=true, Callback=function(v) ForgeFlags.safespot=v end})
+FarmRight:AddSlider('SafespotDist', {Text='Safespot Distance', Default=8, Min=4, Max=14, Rounding=0, Suffix=' studs', Callback=function(v) ForgeFlags.safespot_dist=v end})
 
 -- Filters
 FiltOre:AddDropdown('RaritySelect', {Text='Select Rarity (empty = ALL) - skips others', Default={}, Multi=true, Values=RARITY_ORDER, Callback=function(v) ForgeFlags.rarities_selected = DropToArray(v) end})
@@ -1524,6 +1712,7 @@ LootSell:AddToggle('SellAnywhere', {Text='I own Sell Anywhere Pass', Default=fal
 
 -- Potions
 LootPotion:AddDropdown('PotionSelect', {Text='Select Potion(s)', Default={}, Multi=true, Values=GetPotionList(), Callback=function(v) ForgeFlags.potions_selected = DropToArray(v) end})
+LootPotion:AddSlider('PotionHP', {Text='Drink At HP% (100=always)', Default=100, Min=10, Max=100, Rounding=0, Suffix='%', Callback=function(v) ForgeFlags.potion_hp=v end})
 LootPotion:AddToggle('AutoPotion', {Text='Auto Buy/Drink Potion', Default=false, Callback=function(v)
     ForgeFlags.auto_potion=v
     if not v then return end
@@ -1534,6 +1723,9 @@ LootPotion:AddToggle('AutoPotion', {Text='Auto Buy/Drink Potion', Default=false,
             if not GetChar() then continue end
             if tick() - getgenv().forge_lastRespawn < 10 then continue end
             local need = {}
+            local _, _, ohp = GetChar()
+            local hpPct = (ohp and ohp.MaxHealth > 0) and (ohp.Health / ohp.MaxHealth * 100) or 100
+            local drinkOk = hpPct <= (ForgeFlags.potion_hp or 100)
             for _, pname in ipairs(ForgeFlags.potions_selected) do
                 local hasChar, hasPack = false, false
                 local c = LocalPlayer.Character local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
@@ -1541,7 +1733,7 @@ LootPotion:AddToggle('AutoPotion', {Text='Auto Buy/Drink Potion', Default=false,
                 if bp then for _, t in ipairs(bp:GetChildren()) do if t.Name==pname then hasPack=true break end end end
                 local has = hasChar or hasPack
                 local active = LocalPlayer.PlayerGui:FindFirstChild("Hotbar") and LocalPlayer.PlayerGui.Hotbar:FindFirstChild("Perks") and LocalPlayer.PlayerGui.Hotbar.Perks:FindFirstChild(pname)
-                if has and not active then
+                if has and not active and drinkOk then
                     if ToolActivatedRF then pcall(function() ToolActivatedRF:InvokeServer(pname) end) end
                 elseif not has then
                     table.insert(need, pname)
@@ -1560,7 +1752,7 @@ LootPotion:AddToggle('AutoPotion', {Text='Auto Buy/Drink Potion', Default=false,
                             local has=false
                             if c then for _,t in ipairs(c:GetChildren()) do if t.Name==pn then has=true break end end end
                             if bp and not has then for _,t in ipairs(bp:GetChildren()) do if t.Name==pn then has=true break end end end
-                            if has and ToolActivatedRF then pcall(function() ToolActivatedRF:InvokeServer(pn) end) end
+                            if has and drinkOk and ToolActivatedRF then pcall(function() ToolActivatedRF:InvokeServer(pn) end) end
                             task.wait(0.1)
                         end
                     end
@@ -1837,6 +2029,17 @@ local function GetQuestList()
     table.sort(out)
     return out
 end
+local function GetActiveQuestList()
+    -- QoL: dropdown only ever shows quests you actually have active
+    local defs = GetQuestDefs()
+    local active = select(1, GetReplicaQuests())
+    local out = {}
+    for qid in pairs(active) do
+        if defs[qid] then table.insert(out, qid) end
+    end
+    table.sort(out)
+    return out
+end
 local function QuestObjectiveText(qid)
     local defs = GetQuestDefs()
     local q = defs[qid]
@@ -1969,6 +2172,7 @@ CombatAura:AddSlider('AuraRange', {Text='Aura Range', Default=ForgeFlags.aura_ra
 CombatAura:AddSlider('AuraDelay', {Text='Aura Delay', Default=ForgeFlags.aura_delay, Min=0.1, Max=1, Rounding=2, Suffix='s', Callback=function(v) ForgeFlags.aura_delay = v end})
 CombatAura:AddToggle('AutoSkill', {Text='Auto Skill (Weapon R / heavy)', Default=false, Callback=function(v) ForgeFlags.auto_skill = v end})
 CombatAura:AddToggle('AutoBlock', {Text='Auto Block when mob close', Default=false, Callback=function(v) ForgeFlags.auto_block = v end})
+CombatAura:AddToggle('AuraSelected', {Text='Aura: Selected Mobs Only', Default=false, Callback=function(v) ForgeFlags.aura_selected_only = v end})
 CombatHit:AddToggle('HitExpand', {Text='Expand Mob Hitbox (client)', Default=false, Callback=function(v)
     ForgeFlags.hitbox_expand = v
     if not v and Living then
@@ -2003,24 +2207,49 @@ LootRecycle:AddLabel('Skips safely if renamed.')
 AutoQuest:AddDropdown('QuestMode', {Text='Quest Farm Mode', Default='Off', Values={'Off', 'Selected Only', 'All Quests'}, Callback=function(v)
     ForgeFlags.quest_mode = DropSingle(v, 'Off') or 'Off'
 end})
-AutoQuest:AddDropdown('QuestSelect', {Text='Select Quest(s) - empty = ALL', Default={}, Multi=true, Values=GetQuestList(), Callback=function(v) ForgeFlags.quests_selected = DropToArray(v) end})
+AutoQuest:AddDropdown('QuestSelect', {Text='Farm: YOUR active quests (empty=ALL)', Default={}, Multi=true, Values=GetActiveQuestList(), Callback=function(v) ForgeFlags.quests_selected = DropToArray(v) end})
 AutoQuest:AddToggle('AutoAccept', {Text='Auto Accept (talk to NPC)', Default=false, Callback=function(v) ForgeFlags.auto_accept_quests = v end})
+AutoQuest:AddDropdown('AcceptSelect', {Text='Accept: pick quest to grab', Default={}, Multi=true, Values=GetQuestList(), Callback=function(v) ForgeFlags.quests_accept = DropToArray(v) end})
 AutoQuest:AddToggle('AutoTurnIn', {Text='Auto Turn-In (Talk quests)', Default=false, Callback=function(v) ForgeFlags.auto_turnin_quests = v end})
 AutoQuest:AddToggle('AutoObjectives', {Text='Auto Farm Objectives (Kill/Mine/Collect)', Default=false, Callback=function(v) ForgeFlags.auto_farm_objectives = v end})
 AutoQuest:AddToggle('AutoBoard', {Text='Auto Claim QuestBoard (Daily/Weekly)', Default=false, Callback=function(v) ForgeFlags.auto_claim_board = v end})
 AutoQuest:AddToggle('QuestESP', {Text='Quest NPC ESP', Default=false, Callback=function(v) ForgeFlags.quest_esp = v end})
 AutoQuest:AddToggle('QuestTrack', {Text='Show Quest Tracker Label', Default=true, Callback=function(v) ForgeFlags.quest_track = v end})
-AutoQuest:AddButton('Refresh Quest List', function() if Options.QuestSelect then Options.QuestSelect:SetValues(GetQuestList()) end end)
+AutoQuest:AddButton('Refresh Quest List', function()
+    if Options.QuestSelect then Options.QuestSelect:SetValues(GetActiveQuestList()) end
+    if Options.AcceptSelect then Options.AcceptSelect:SetValues(GetQuestList()) end
+end)
 AutoQuest:AddButton('TP To Current Quest NPC', function()
+    -- works even with Quest Mode off: falls back to first active selected quest
     local qid = getgenv().forge_current_quest
-    if not qid then return end
     local defs = GetQuestDefs()
-    local q = defs[qid]
-    local npc = q and q.Npc
-    if npc then
-        local m = FindNPCModel(npc)
-        if m then StealthMove(m:GetPivot(), true) end
+    if not qid then
+        local active = select(1, GetReplicaQuests())
+        local ids = {}
+        for id in pairs(active) do table.insert(ids, id) end
+        table.sort(ids)
+        for _, id in ipairs(ids) do
+            if QuestIsSelected(id) and defs[id] and defs[id].Npc then qid = id break end
+        end
     end
+    if not qid then pcall(function() Creep:Notify("Quest TP: no active quest", 4) end) return end
+    local npc = defs[qid] and defs[qid].Npc
+    if not npc then pcall(function() Creep:Notify("Quest TP: quest has no NPC", 4) end) return end
+    if not FindNPCModel(npc) then pcall(function() Creep:Notify("Quest TP: NPC not on this island: " .. tostring(npc), 4) end) return end
+    pcall(function() Creep:Notify("Quest TP: going to " .. tostring(npc), 3) end)
+    task.spawn(function()
+        -- pause farms so they don't drag you back mid-travel, resume after
+        local saved = SaveFarming() DisableFarming()
+        task.wait(0.2)
+        local ok = false
+        pcall(function() ok = TalkToNPC(npc) end)
+        if saved.ore_autofarm and Toggles.OreFarm then pcall(function() Toggles.OreFarm:SetValue(true) end) end
+        if saved.ore_closestfarm and Toggles.ClosestOre then pcall(function() Toggles.ClosestOre:SetValue(true) end) end
+        if saved.mob_autofarm and Toggles.MobFarm then pcall(function() Toggles.MobFarm:SetValue(true) end) end
+        if saved.mob_closestfarm and Toggles.ClosestMob then pcall(function() Toggles.ClosestMob:SetValue(true) end) end
+        if saved.regional_ore_farm and Toggles.RegionFarm then pcall(function() Toggles.RegionFarm:SetValue(true) end) end
+        pcall(function() Creep:Notify(ok and ("Quest TP: reached " .. tostring(npc)) or ("Quest TP: could not reach " .. tostring(npc)), 3) end)
+    end)
 end)
 AutoQuest:AddLabel('Accept: walks to NPC + talks.')
 AutoQuest:AddLabel('Objectives: auto-sets filters.')
@@ -2100,6 +2329,28 @@ VisPerf:AddToggle('FPSBoost', {Text='FPS Boost (particles off)', Default=false, 
 end})
 VisPerf:AddSlider('FOV', {Text='Camera FOV', Default=70, Min=40, Max=120, Rounding=0, Callback=function(v) ForgeFlags.fov_value = v pcall(function() WS.CurrentCamera.FieldOfView = v end) end})
 VisPerf:AddToggle('HidePlayers', {Text='Hide Other Players', Default=false, Callback=function(v) ForgeFlags.hide_players = v end})
+VisPerf:AddToggle('SteadyCam', {Text='Steady Cam (no hit shake)', Default=true, Callback=function(v) ForgeFlags.steady_cam = v end})
+task.spawn(function()
+    -- game shakes the camera on every hit via _G.CameraShaker; mute it while enabled
+    while task.wait(2) do
+        if ForgeFlags.steady_cam then
+            pcall(function()
+                local cs = _G.CameraShaker
+                if cs and not getgenv().forge_shakeOff then
+                    getgenv().forge_shakeOff = true
+                    if not getgenv().forge_origShake then getgenv().forge_origShake = cs.ShakeOnce end
+                    cs.ShakeOnce = function() end
+                end
+            end)
+        elseif getgenv().forge_shakeOff then
+            pcall(function()
+                local cs = _G.CameraShaker
+                if cs and getgenv().forge_origShake then cs.ShakeOnce = getgenv().forge_origShake end
+            end)
+            getgenv().forge_shakeOff = false
+        end
+    end
+end)
 
 -- Server
 SrvMain:AddButton('Copy JobId', function() if SetClipboardFn then SetClipboardFn(game.JobId) else pcall(function() Creep:Notify("No clipboard on this executor", 3) end) end end)
@@ -2140,6 +2391,10 @@ SrvAuto:AddToggle('AutoPickaxe', {Text='Auto Buy Better Pickaxe', Default=false,
 SrvAuto:AddToggle('ReconnectKick', {Text='Auto Reconnect If Kicked', Default=true, Callback=function(v) ForgeFlags.reconnect_on_kick = v end})
 SrvAuto:AddSlider('MaxReconnect', {Text='Max Reconnect Tries', Default=ForgeFlags.max_reconnects, Min=1, Max=10, Rounding=0, Callback=function(v) ForgeFlags.max_reconnects = v end})
 SrvAuto:AddInput('LoaderURL', {Text='Loader URL (for re-exec)', Default="", Placeholder='paste your raw Forge_Stealth.lua URL', Finished=true, Callback=function(v) ForgeFlags.loader_url = v end})
+SrvAuto:AddToggle('PauseNear', {Text='Pause Farm Near Players', Default=false, Callback=function(v) ForgeFlags.pause_near = v end})
+SrvAuto:AddSlider('PauseRadius', {Text='Pause Radius', Default=40, Min=10, Max=200, Rounding=0, Suffix=' studs', Callback=function(v) ForgeFlags.pause_radius = v end})
+SrvAuto:AddToggle('HopDead', {Text='Hop If Server Dead', Default=false, Callback=function(v) ForgeFlags.hop_dead = v end})
+SrvAuto:AddSlider('DeadMins', {Text='Dead After', Default=5, Min=2, Max=30, Rounding=0, Suffix='m', Callback=function(v) ForgeFlags.dead_mins = v end})
 
 -- staff watcher + auto pickaxe buyer
 do
@@ -2300,6 +2555,12 @@ task.spawn(function()
                     local r = m:FindFirstChild("HumanoidRootPart")
                     local h = m:FindFirstChildOfClass("Humanoid")
                     if r and h and h.Health > 0 and (hrp.Position - r.Position).Magnitude <= ForgeFlags.aura_range then
+                        if ForgeFlags.aura_selected_only and #ForgeFlags.mobs_selected > 0 then
+                            local base = BaseName(m.Name)
+                            local sel = false
+                            for _, s in ipairs(ForgeFlags.mobs_selected) do if base == s then sel = true break end end
+                            if not sel then continue end
+                        end
                         if EquipTool("Weapon") and ToolActivatedRF then
                             pcall(function() ToolActivatedRF:InvokeServer("Weapon") end)
                             swung = true
@@ -2366,25 +2627,25 @@ do
             pcall(function() hrp.CFrame = CFrame.new(0, 50, 0) hrp.Velocity = Vector3.new() end)
         end
         if ForgeFlags.fly_enabled then
-            if not flyVel or flyVel.Parent ~= hrp then
-                if flyVel then pcall(function() flyVel:Destroy() end) end
-                flyVel = Instance.new("BodyVelocity")
-                flyVel.MaxForce = Vector3.new(1e9,1e9,1e9)
-                flyVel.Parent = hrp
+            -- CFrame fly: MoveDirection is already world-space, use it raw.
+            -- Space = up, C / LeftControl = down. Works on mobile joystick too.
+            h.PlatformStand = true
+            local md = h.MoveDirection
+            local vy = 0
+            if UIS:IsKeyDown(Enum.KeyCode.Space) then vy = 1 end
+            if UIS:IsKeyDown(Enum.KeyCode.C) or UIS:IsKeyDown(Enum.KeyCode.LeftControl) then vy = -1 end
+            local step = md * ForgeFlags.fly_speed * dt + Vector3.new(0, vy * ForgeFlags.fly_speed * dt)
+            if step.Magnitude > 0 then
+                hrp.CFrame = hrp.CFrame + step
+                local flat = Vector3.new(step.X, 0, step.Z)
+                if flat.Magnitude > 0.001 then
+                    hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + flat)
+                end
             end
-            local dir = h.MoveDirection
-            local cf = Camera.CFrame
-            local move = Vector3.new()
-            if dir.Magnitude > 0 then
-                move = (cf.LookVector * -dir.Z + cf.RightVector * dir.X)
-                -- vertical via jump/sink keys
-                if UIS:IsKeyDown(Enum.KeyCode.Space) then move = move + Vector3.new(0,1,0) end
-                if UIS:IsKeyDown(Enum.KeyCode.LeftShift) then move = move - Vector3.new(0,1,0) end
-                if move.Magnitude > 0 then move = move.Unit * ForgeFlags.fly_speed end
-            end
-            flyVel.Velocity = move
-            hrp.Velocity = move * 0.1
+            hrp.Velocity = Vector3.new()
+            hrp.RotVelocity = Vector3.new()
         else
+            if h.PlatformStand then h.PlatformStand = false end
             if flyVel then pcall(function() flyVel:Destroy() end) flyVel = nil end
         end
     end)
@@ -2660,15 +2921,29 @@ task.spawn(function()
                 if QuestESPFolder then pcall(function() QuestESPFolder:Destroy() end) QuestESPFolder = nil end
             end
         end)
+        -- QoL: keep farm dropdown synced to active quests (only on change)
+        if Options.QuestSelect and tick() - (getgenv().forge_qrefresh or 0) > 5 then
+            getgenv().forge_qrefresh = tick()
+            local al = GetActiveQuestList()
+            local sig = table.concat(al, ",")
+            if sig ~= (getgenv().forge_qsig or "") then
+                getgenv().forge_qsig = sig
+                pcall(function() Options.QuestSelect:SetValues(al) end)
+                local act = select(1, GetReplicaQuests())
+                local keep = {}
+                for _, s in ipairs(ForgeFlags.quests_selected) do if act[s] then table.insert(keep, s) end end
+                ForgeFlags.quests_selected = keep
+            end
+        end
         if mode == "Off" or not wantFarm then continue end
         if getgenv().forge_current_tween then continue end
         local ok, _, _, hrp = GetChar()
         if not ok then continue end
-        -- accept pass: explicitly selected quests only (never auto-grabs everything)
-        if ForgeFlags.auto_accept_quests and tick() - lastTalk > 8 and #ForgeFlags.quests_selected > 0 then
+        -- accept pass: explicitly picked quests only (never auto-grabs everything)
+        if ForgeFlags.auto_accept_quests and tick() - lastTalk > 8 and #ForgeFlags.quests_accept > 0 then
             local defsA = GetQuestDefs()
             local actA, compA, cdA = GetReplicaQuests()
-            for _, aqid in ipairs(ForgeFlags.quests_selected) do
+            for _, aqid in ipairs(ForgeFlags.quests_accept) do
                 if not actA[aqid] and not compA[aqid] and not cdA[aqid] and defsA[aqid] and defsA[aqid].Npc then
                     lastTalk = tick()
                     local saved = SaveFarming() DisableFarming()
@@ -2853,16 +3128,8 @@ do
     end)
 end
 
--- boss priority wrapper for mob loops
+-- boss priority wrapper for mob loops (uses chunk-level IsBossModel above)
 do
-    local function IsBossModel(m)
-        if not m then return false end
-        local n = m.Name:lower()
-        if n:find("boss") or n:find("golem") or n:find("asura") then return true end
-        local h = m:FindFirstChildOfClass("Humanoid")
-        if h and h.MaxHealth and h.MaxHealth > 5000 then return true end
-        return false
-    end
     local OldSel = FindSelectedMob
     FindSelectedMob = function()
         if ForgeFlags.boss_farm and Living then
