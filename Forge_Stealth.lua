@@ -1119,16 +1119,39 @@ local function TalkGreedy(slot, qty, direct)
 end
 
 --// webhook (Ather-style embed)
-local function SendWebhook(title, desc)
-    if not ForgeFlags.webhook_enabled or ForgeFlags.webhook_url == "" then return end
+local function SendWebhook(title, desc, force)
+    local url = (ForgeFlags.webhook_url or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if url == "" then
+        if force then pcall(function() Creep:Notify("Webhook: no URL set - paste it first", 4) end) end
+        return false
+    end
+    if not force and not ForgeFlags.webhook_enabled then return false end
+    if not (url:find("discord%.com/api/webhooks") or url:find("discordapp%.com/api/webhooks")) then
+        if force then pcall(function() Creep:Notify("Webhook: URL doesn't look like a Discord webhook - trying anyway", 4) end) end
+    end
+    local uid = (ForgeFlags.webhook_user_id or ""):gsub("%s+", "")
     local msg = title
-    if ForgeFlags.webhook_user_id ~= "" then msg = string.format("<@%s> %s", ForgeFlags.webhook_user_id, title) end
+    if uid ~= "" then msg = string.format("<@%s> %s", uid, title) end
     local payload = {username="Forge Stealth", content=msg, embeds={{title="**Forge Stealth**", description=desc, type="rich", color=7498202}}}
     local ok, body = pcall(function() return HttpSvc:JSONEncode(payload) end)
-    if not ok then return end
-    local req = http_request or request or (syn and syn.request)
-    if not req then return end
-    pcall(function() req({Url=ForgeFlags.webhook_url, Body=body, Method="POST", Headers={["content-type"]="application/json"}}) end)
+    if not ok then
+        if force then pcall(function() Creep:Notify("Webhook: failed to encode payload", 4) end) end
+        return false
+    end
+    local req = http_request or request or HttpPost or (syn and syn.request) or (http and http.request) or (fluxus and fluxus.request)
+    if not req then
+        if force then pcall(function() Creep:Notify("Webhook: executor has no request function - try another executor", 5) end) end
+        return false
+    end
+    local sent, err = pcall(function() return req({Url=url, Body=body, Method="POST", Headers={["content-type"]="application/json"}}) end)
+    if force then
+        if sent then
+            pcall(function() Creep:Notify("Webhook sent - check Discord (if nothing arrives the URL is wrong)", 4) end)
+        else
+            pcall(function() Creep:Notify("Webhook send failed: " .. tostring(err):sub(1, 120), 5) end)
+        end
+    end
+    return sent
 end
 
 --// forge automation (VIM, humanized)
@@ -1241,7 +1264,7 @@ FarmRight:AddButton('Refresh NPCs', function() if Options.MobSelect then Options
 -- Filters
 FiltOre:AddDropdown('RaritySelect', {Text='Select Rarity (empty = ALL) - skips others', Default={}, Multi=true, Values=RARITY_ORDER, Callback=function(v) ForgeFlags.rarities_selected = DropToArray(v) end})
 FiltOre:AddToggle('SkipClaimed', {Text='Skip Claimed (Someone) Rocks', Default=ForgeFlags.skip_claimed, Callback=function(v) ForgeFlags.skip_claimed=v end})
-FiltOre:AddLabel('How skip works:\n- Claimed/Dead/NoHitbox = skip\n- Ore name not in list = skip\n- Rarity not in list = skip\n- Else mine by Priority then Distance')
+FiltOre:AddLabel('How skip works:\n- Claimed/Dead/NoHitbox = skip\n- Ore name not in list = skip\n- Rarity not in list = skip\n- Else mine by Priority then Distance', true)
 -- Priority sliders (build dynamically, max 15 most common to avoid UI spam + button for rest)
 do
     local ores = GetOreList()
@@ -1259,7 +1282,7 @@ do
             Options[key].Callback = function(v) ForgeFlags.ore_priority[nm]=v end
         end
     end
-    FiltPrio:AddLabel('Top 20 shown. All ores default 0.\nSet higher (e.g Diamond 10) to farm first.')
+    FiltPrio:AddLabel('Top 20 shown. All ores default 0.\nSet higher (e.g Diamond 10) to farm first.', true)
 end
 
 -- Forge tab
@@ -1278,7 +1301,7 @@ ForgeMelt:AddToggle('AutoPour', {Text='Auto Pour', Default=false, Callback=funct
 ForgeMelt:AddSlider('PourSens', {Text='Pour Sensitivity', Default=ForgeFlags.poursens, Min=0, Max=0.1, Rounding=3, Callback=function(v) ForgeFlags.poursens=v end})
 ForgeHammer:AddToggle('AutoHammer', {Text='Auto Hammer (perfect ~0.53)', Default=false, Callback=function(v) ForgeFlags.autohammer=v end})
 ForgeHammer:AddToggle('AutoMold', {Text='Auto Mold (click mold)', Default=false, Callback=function(v) ForgeFlags.automold=v end})
-ForgeHammer:AddLabel('Requires VirtualInputManager.\nIf executor blocks VIM, forge\ntoggles will notify.')
+ForgeHammer:AddLabel('Requires VirtualInputManager.\nIf executor blocks VIM, forge\ntoggles will notify.', true)
 
 -- forge loops (humanized VIM, same logic as LazyHub but jittered)
 do
@@ -1553,7 +1576,7 @@ PlrTP:AddDropdown('IslandTP', {Text='Teleport: Any Island (works any world)', De
     local s = DropSingle(v, nil)
     if s and TeleportRF then pcall(function() TeleportRF:InvokeServer(s) end) end
 end})
-PlrTP:AddLabel('W3 needs lvl 70, W4 lvl 100.\nServer validates reqs.')
+PlrTP:AddLabel('W3 needs lvl 70, W4 lvl 100.\nServer validates reqs.', true)
 PlrTP:AddButton('Server Hop (smallest)', function()
     pcall(function()
         local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100", game.PlaceId)
@@ -1578,13 +1601,25 @@ WhSet:AddToggle('WebhookQuests', {Text='Notify Quest Complete', Default=true, Ca
 WhSet:AddToggle('WebhookLevels', {Text='Notify Level Up', Default=true, Callback=function(v) ForgeFlags.webhook_levels=v end})
 WhSet:AddToggle('WebhookStatus', {Text='Status Heartbeat (gold/hr)', Default=false, Callback=function(v) ForgeFlags.webhook_status=v end})
 WhSet:AddSlider('WebhookMins', {Text='Heartbeat Every', Default=ForgeFlags.webhook_status_mins, Min=5, Max=60, Rounding=0, Suffix='m', Callback=function(v) ForgeFlags.webhook_status_mins=v end})
-WhTest:AddButton('Test Webhook', function() SendWebhook("Test ping :white_check_mark:", string.format("Player: %s\nLevel: %d\nPlace: %d\nJobId: %s", LocalPlayer.Name, PlayerLevel(), game.PlaceId, game.JobId)) end)
+WhTest:AddButton('Test Webhook', function()
+    -- input uses Finished=true, so sync live text in case Enter was never pressed
+    pcall(function()
+        if Options.WebhookURL and type(Options.WebhookURL.Value) == "string" then
+            local v = Options.WebhookURL.Value:gsub("^%s+", ""):gsub("%s+$", "")
+            if v ~= "" then ForgeFlags.webhook_url = v end
+        end
+        if Options.WebhookUID and type(Options.WebhookUID.Value) == "string" then
+            ForgeFlags.webhook_user_id = Options.WebhookUID.Value:gsub("%s+", "")
+        end
+    end)
+    SendWebhook("Test ping :white_check_mark:", string.format("Player: %s\nLevel: %d\nPlace: %d\nJobId: %s", LocalPlayer.Name, PlayerLevel(), game.PlaceId, game.JobId), true)
+end)
 WhTest:AddButton('Send Status Now', function()
     local g = GoldNow()
     local profit = g - (ForgeFlags.session_gold_start or 0)
-    SendWebhook("Status :bar_chart:", string.format("Player: %s\nLevel: %d\nGold: %d (%+d session)\nOres: %d\nQuest: %s\nPlace: %d\nJobId: %s", LocalPlayer.Name, PlayerLevel(), g, profit, OresMinedSession, tostring(getgenv().forge_current_quest or "none"), game.PlaceId, game.JobId))
+    SendWebhook("Status :bar_chart:", string.format("Player: %s\nLevel: %d\nGold: %d (%+d session)\nOres: %d\nQuest: %s\nPlace: %d\nJobId: %s", LocalPlayer.Name, PlayerLevel(), g, profit, OresMinedSession, tostring(getgenv().forge_current_quest or "none"), game.PlaceId, game.JobId), true)
 end)
-WhTest:AddLabel('Ather parity:\n- Ores (name+rarity)\n- Quest complete\n- Level up\n- Status heartbeat')
+WhTest:AddLabel('Ather parity:\n- Ores (name+rarity)\n- Quest complete\n- Level up\n- Status heartbeat', true)
 
 --// ===== EVERYTHING PACK (combat / auto / visuals / server) =====
 -- rock-type filter wrapper (extends RockPassesFilter defined above)
@@ -1802,7 +1837,7 @@ local QuestESPFolder = nil
 -- Filters: rock type
 FiltRock:AddDropdown('RockTypeSelect', {Text='Select Rock Type (empty=ALL)', Default={}, Multi=true, Values=GetRockTypeList(), Callback=function(v) ForgeFlags.rocktypes_selected = DropToArray(v) end})
 FiltRock:AddButton('Refresh Rock Types', function() if Options.RockTypeSelect then Options.RockTypeSelect:SetValues(GetRockTypeList()) end end)
-FiltRock:AddLabel('Example: Basalt Vein, Volcanic Rock,\nLarge Ice Crystal, Spirit Rock.\nSkips all other rock models.')
+FiltRock:AddLabel('Example: Basalt Vein, Volcanic Rock,\nLarge Ice Crystal, Spirit Rock.\nSkips all other rock models.', true)
 
 -- Farm stats
 FarmStats:AddLabel('Tracking gold + ores this session.')
@@ -1833,15 +1868,15 @@ CombatHit:AddToggle('HitExpand', {Text='Expand Mob Hitbox (client)', Default=fal
     end
 end})
 CombatHit:AddSlider('HitSize', {Text='Hitbox Size', Default=ForgeFlags.hitbox_size, Min=4, Max=20, Rounding=0, Callback=function(v) ForgeFlags.hitbox_size = v end})
-CombatHit:AddLabel('Risky: visible to others if\ntransparency glitches. Client only.')
+CombatHit:AddLabel('Risky: visible to others if\ntransparency glitches. Client only.', true)
 CombatBoss:AddToggle('BossFarm', {Text='Prioritize Bosses', Default=false, Callback=function(v) ForgeFlags.boss_farm = v end})
-CombatBoss:AddLabel('Boss = name has Boss/Golem/\nAsura or HP > 5000. Works with\nSelected + Closest mob farm.')
+CombatBoss:AddLabel('Boss = name has Boss/Golem/\nAsura or HP > 5000. Works with\nSelected + Closest mob farm.', true)
 
 -- Loot recycle/enhance (safe: VIM click fallback + direct service pcall)
 LootRecycle:AddDropdown('RecycleRar', {Text='Recycle Rarities (weapons/armor)', Default={}, Multi=true, Values=RARITY_ORDER, Callback=function(v) ForgeFlags.recycle_rarities = DropToArray(v) end})
 LootRecycle:AddToggle('AutoRecycle', {Text='Auto Recycle (low rarity)', Default=false, Callback=function(v) ForgeFlags.auto_recycle = v end})
 LootRecycle:AddToggle('AutoEnhance', {Text='Auto Enhance Selected (EnhanceService)', Default=false, Callback=function(v) ForgeFlags.auto_enhance = v end})
-LootRecycle:AddLabel('Recycle/enhance use official\nservices via pcall. If game\nrenamed them, it safely skips.')
+LootRecycle:AddLabel('Recycle/enhance use official\nservices via pcall. If game\nrenamed them, it safely skips.', true)
 
 -- Auto tab
 -- Auto tab: quests (Ather parity - start / farm / turn-in)
@@ -1867,7 +1902,7 @@ AutoQuest:AddButton('TP To Current Quest NPC', function()
         if m then StealthMove(m:GetPivot(), true) end
     end
 end)
-AutoQuest:AddLabel('How it works:\n- Accept: walks to Npc + Dialogue\n  + GiveQuest\n- Kill/Mine/Collect: auto-sets\n  mob/ore/rock filters + farms\n- Talk: walks + talks to turn in\n- Board: claims QuestBoard tiers')
+AutoQuest:AddLabel('How it works:\n- Accept: walks to Npc + Dialogue\n  + GiveQuest\n- Kill/Mine/Collect: auto-sets\n  mob/ore/rock filters + farms\n- Talk: walks + talks to turn in\n- Board: claims QuestBoard tiers', true)
 AutoQuest:AddToggle('AutoDaily', {Text='Auto Claim Daily Login', Default=false, Callback=function(v) ForgeFlags.auto_daily = v end})
 AutoQuest:AddToggle('AutoMail', {Text='Auto Claim Mailbox', Default=false, Callback=function(v) ForgeFlags.auto_mail = v end})
 AutoQuest:AddToggle('AutoQuestOld', {Text='Auto Talk QuestBoard NPC', Default=false, Callback=function(v) ForgeFlags.auto_quest = v end})
@@ -2053,7 +2088,7 @@ end
 -- Forge auto cycle
 ForgeAuto:AddToggle('AutoForgeCycle', {Text='Auto Go To Forge + Start', Default=false, Callback=function(v) ForgeFlags.auto_forge_cycle = v end})
 ForgeAuto:AddInput('MoldName', {Text='Mold / Item Name (optional)', Default="", Placeholder='e.g. Dagger', Finished=true, Callback=function(v) ForgeFlags.forge_mold_name = v end})
-ForgeAuto:AddLabel('Walks to Forge prompt and\nfires it. Then use Melt/Pour/\nHammer/Mold toggles.')
+ForgeAuto:AddLabel('Walks to Forge prompt and\nfires it. Then use Melt/Pour/\nHammer/Mold toggles.', true)
 ForgeAuto:AddToggle('InstantForge', {Text='Instant Forge (try skip, no pass)', Default=false, Callback=function(v)
     ForgeFlags.instant_forge = v
     pcall(function()
@@ -2101,7 +2136,7 @@ ForgeAuto:AddToggle('InstantForge', {Text='Instant Forge (try skip, no pass)', D
         end
     end)
 end})
-ForgeAuto:AddLabel('How skip works:\n- Sets Forge.FastForge=true\n  in Melt request\n- Instants Melt/Pour Start\n  to 0.5s perfect\n- If server checks pass,\n  falls back to VIM play.')
+ForgeAuto:AddLabel('How skip works:\n- Sets Forge.FastForge=true\n  in Melt request\n- Instants Melt/Pour Start\n  to 0.5s perfect\n- If server checks pass,\n  falls back to VIM play.', true)
 
 -- loops for everything pack
 task.spawn(function()
@@ -2958,4 +2993,5 @@ Creep:OnUnload(function()
 end)
 
 print("[ForgeStealth] loaded - stealth, no hooks, smart skip ready")
+
 
