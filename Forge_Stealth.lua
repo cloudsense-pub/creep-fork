@@ -170,6 +170,7 @@ getgenv().ForgeFlags = getgenv().ForgeFlags or {
     forge_mold_name = "",
     auto_waypoints = false,
     instant_forge = false,
+    humanized = true,
     -- quest farm (Ather parity)
     quest_mode = "Off",
     quests_selected = {},
@@ -750,19 +751,25 @@ local function StealthMove(target, isCFrameOverride)
         if (ForgeFlags.ore_autofarm or ForgeFlags.ore_closestfarm or ForgeFlags.regional_ore_farm) and getgenv().forge_orefound then getgenv().forge_orefound = false end
     end
 
-    -- instant TP via reset (only if enabled = NOT disabled, far, cooldown ok)
-    if not ForgeFlags.disable_instant_tp and dist > ForgeFlags.insta_tp_if then
+    -- instant TP via reset (skipped entirely in humanized mode - snaps get you banned)
+    if not ForgeFlags.humanized and not ForgeFlags.disable_instant_tp and dist > ForgeFlags.insta_tp_if then
         if DoResetTeleport(targetCF or CFrame.new(targetPos)) then return end
     end
     if not farming and not isCFrameOverride then return end
 
     -- tween
     local speed = math.max(ForgeFlags.tweenspeed, 1)
+    if ForgeFlags.humanized and speed > 45 then speed = 45 end
     -- stealth variance +-10%
     speed = speed * (0.9 + math.random()*0.2)
     local dur = dist / speed
     if dur <= 0 then return end
     getgenv().forge_current_tween = true
+    getgenv().forge_tween_start = tick()
+    if ForgeFlags.humanized and math.random() < 0.25 then task.wait(0.3 + math.random()*0.9) end
+    local okR, _, _, hrpR = GetChar()
+    if not okR then getgenv().forge_current_tween = false return end
+    hrp = hrpR
     local start = hrp.Position
     local delta = targetPos - start
     local t0 = tick()
@@ -927,7 +934,7 @@ end
 
 --// auto mine (humanized, no hooks)
 task.spawn(function()
-    while task.wait((ForgeFlags.mine_delay or 0.15) + math.random()*0.05) do
+    while task.wait(math.max(ForgeFlags.mine_delay or 0.15, (ForgeFlags.humanized and 0.14 or 0)) + math.random()*0.05) do
         local npc = getgenv().forge_npcfound and (ForgeFlags.mob_autofarm or ForgeFlags.mob_closestfarm)
         local ore = getgenv().forge_orefound and (ForgeFlags.ore_autofarm or ForgeFlags.ore_closestfarm or ForgeFlags.regional_ore_farm)
         if npc then
@@ -971,6 +978,24 @@ task.spawn(function()
                 local c = LocalPlayer.Character
                 if c then for _, p in ipairs(c:GetDescendants()) do if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end end end
             end
+        end
+    end
+end)
+
+--// tween watchdog: a tween stuck >30s halts ALL farming, so force-clear it
+task.spawn(function()
+    local since = nil
+    while task.wait(2) do
+        if getgenv().forge_current_tween then
+            if not since then since = tick()
+            elseif tick() - since > 30 then
+                getgenv().forge_current_tween = false
+                getgenv().forge_isTeleporting = false
+                since = nil
+                pcall(function() Creep:Notify("Tween watchdog: unstuck", 3) end)
+            end
+        else
+            since = nil
         end
     end
 end)
@@ -1239,6 +1264,14 @@ FarmMove:AddToggle('UnderTween', {Text='Underground Tween (stealth)', Default=Fo
 FarmMove:AddToggle('Jitter', {Text='Position Jitter (anti-detect)', Default=ForgeFlags.stealth_jitter, Callback=function(v) ForgeFlags.stealth_jitter=v end})
 FarmMove:AddToggle('DisableTP', {Text='Disable Reset-TP (stealth ON)', Default=ForgeFlags.disable_instant_tp, Callback=function(v) ForgeFlags.disable_instant_tp=v end})
 FarmMove:AddToggle('Noclip', {Text='Noclip While Tween', Default=ForgeFlags.noclip_farm, Callback=function(v) ForgeFlags.noclip_farm=v end})
+FarmMove:AddToggle('Humanized', {Text='Humanized Mode (legit, anti-ban)', Default=true, Callback=function(v)
+    ForgeFlags.humanized = v
+    if v and ForgeFlags.instant_forge then
+        ForgeFlags.instant_forge = false
+        if Toggles.InstantForge then pcall(function() Toggles.InstantForge:SetValue(false) end) end
+        pcall(function() Creep:Notify("Humanized ON: instant forge off", 3) end)
+    end
+end})
 FarmMove:AddDropdown('FarmMethod', {Text='Farm Method', Default=ForgeFlags.farmmethod, Values={"Above/Below","Front/Behind"}, Callback=function(v) ForgeFlags.farmmethod = (type(v)=="table" and DropSingle(v, "Above/Below")) or v end})
 
 -- Ore farm
@@ -1823,18 +1856,66 @@ local function QuestObjectiveText(qid)
     end
     return table.concat(lines, "\n")
 end
+local FARMABLE_TYPES = {Kill = true, Mine = true, Collect = true, Forge = true, Talk = true}
+local UIProgCache = {}
+local UIProgTime = 0
+local function GetUIQuestProgress()
+    -- fallback progress reader: parses the game's own quest tracker UI
+    -- (lines like "- Mine Basalt Core: 4/25"). Used when Knit replica is unreadable.
+    if tick() - UIProgTime < 3 then return UIProgCache end
+    UIProgTime = tick()
+    UIProgCache = {}
+    pcall(function()
+        local list = LocalPlayer.PlayerGui.Main.Screen.Quests.List
+        for _, d in ipairs(list:GetDescendants()) do
+            if d:IsA("TextLabel") then
+                local t = d.Text or ""
+                local verb, tgt, cur, req = t:match("^%s*%-?%s*(%a+)%s+(.-)%s*:%s*(%d+)/(%d+)")
+                if tgt and cur then
+                    tgt = Clean(tgt)
+                    if tgt ~= "" then UIProgCache[tgt:lower()] = {cur = tonumber(cur), req = tonumber(req)} end
+                end
+            end
+        end
+    end)
+    return UIProgCache
+end
+local function ObjProgress(qid, idx, obj)
+    -- replica first, game-UI second, assume-zero last
+    local otgt = obj.Target
+    local oreq = obj.Amount or 1
+    local ocur = 0
+    local haveReplica = false
+    pcall(function()
+        local active = select(1, GetReplicaQuests())
+        local prog = active[qid] and active[qid].Progress or {}
+        local p = prog[idx] or prog[tostring(idx)] or {}
+        if type(p.currentProgress) == "number" then ocur = p.currentProgress haveReplica = true end
+        if p.requiredAmount then oreq = p.requiredAmount end
+        if type(p.target) == "string" and p.target ~= "" then otgt = p.target end
+    end)
+    if not haveReplica and type(otgt) == "string" then
+        local hit = GetUIQuestProgress()[otgt:lower()]
+        if hit then ocur = hit.cur oreq = hit.req end
+    end
+    if type(oreq) == "function" then oreq = "?" end
+    if type(otgt) == "function" then otgt = "?" end
+    return ocur, oreq, otgt
+end
 local function FirstIncompleteObjective(qid)
+    -- ACTIVE quests only, first incomplete FARMABLE objective.
+    -- Extra/bring-item types are skipped (can't auto-farm handoffs).
     local defs = GetQuestDefs()
     local q = defs[qid]
     if not q or type(q.Objectives) ~= "table" then return nil, nil end
-    local active = select(1, GetReplicaQuests())
-    local prog = active[qid] and active[qid].Progress or {}
     for idx, obj in ipairs(q.Objectives) do
-        local p = prog[idx] or prog[tostring(idx)] or {}
-        local cur = p.currentProgress or 0
-        local req = p.requiredAmount or obj.Amount or 1
-        if type(req) == "function" then return idx, obj end -- unknown amount = treat as incomplete
-        if type(cur) ~= "number" or cur < req then return idx, obj end
+        if FARMABLE_TYPES[obj.Type] then
+            local cur, req = ObjProgress(qid, idx, obj)
+            if req == "?" then return idx, obj end
+            if type(cur) == "number" and type(req) == "number" and cur < req then
+                return idx, obj
+            end
+        end
     end
     return nil, nil
 end
@@ -2134,6 +2215,12 @@ ForgeAuto:AddLabel('Walks to Forge + fires prompt.')
 ForgeAuto:AddLabel('Then use Melt/Pour/Hammer.')
 ForgeAuto:AddToggle('InstantForge', {Text='Instant Forge (try skip, no pass)', Default=false, Callback=function(v)
     ForgeFlags.instant_forge = v
+    if v and ForgeFlags.humanized then
+        ForgeFlags.instant_forge = false
+        pcall(function() Creep:Notify("Turn OFF Humanized for instant forge", 4) end)
+        if Toggles.InstantForge then pcall(function() Toggles.InstantForge:SetValue(false) end) end
+        return
+    end
     pcall(function()
         local Knit = require(RS.Shared.Packages.Knit)
         -- 1) try FastForge flag: Modules.Forge.FastForge is sent in Melt request.
@@ -2501,21 +2588,22 @@ local function QuestIsSelected(qid)
     return false
 end
 local function PickQuestTarget()
+    -- ACTIVE quests only. First quest (sorted) with an incomplete farmable
+    -- objective. Talk objectives are only picked when turn-in is enabled.
     local defs = GetQuestDefs()
     local active = select(1, GetReplicaQuests())
-    -- prefer active selected quest with incomplete objective
-    for qid, _ in pairs(active) do
+    local ids = {}
+    for qid in pairs(active) do table.insert(ids, qid) end
+    table.sort(ids)
+    for _, qid in ipairs(ids) do
         if QuestIsSelected(qid) and defs[qid] then
             local idx, obj = FirstIncompleteObjective(qid)
-            if idx and obj then return qid, idx, obj end
-        end
-    end
-    -- else first selectable def not completed (for accept)
-    if ForgeFlags.auto_accept_quests then
-        local _, completed, cooldown = GetReplicaQuests()
-        for _, qid in ipairs(GetQuestList()) do
-            if QuestIsSelected(qid) and not active[qid] and not completed[qid] and not cooldown[qid] then
-                return qid, 0, {Type = "Accept", Target = (defs[qid] and defs[qid].Npc) or "?"}
+            if idx and obj then
+                if obj.Type == "Talk" and not ForgeFlags.auto_turnin_quests then
+                    -- turn-in disabled: try next quest instead of stalling
+                else
+                    return qid, idx, obj
+                end
             end
         end
     end
@@ -2576,6 +2664,20 @@ task.spawn(function()
         if getgenv().forge_current_tween then continue end
         local ok, _, _, hrp = GetChar()
         if not ok then continue end
+        -- accept pass: explicitly selected quests only (never auto-grabs everything)
+        if ForgeFlags.auto_accept_quests and tick() - lastTalk > 8 and #ForgeFlags.quests_selected > 0 then
+            local defsA = GetQuestDefs()
+            local actA, compA, cdA = GetReplicaQuests()
+            for _, aqid in ipairs(ForgeFlags.quests_selected) do
+                if not actA[aqid] and not compA[aqid] and not cdA[aqid] and defsA[aqid] and defsA[aqid].Npc then
+                    lastTalk = tick()
+                    local saved = SaveFarming() DisableFarming()
+                    pcall(function() TalkToNPC(defsA[aqid].Npc) end)
+                    ForgeFlags.mob_autofarm = saved.mob_autofarm ForgeFlags.mob_closestfarm = saved.mob_closestfarm ForgeFlags.ore_autofarm = saved.ore_autofarm ForgeFlags.ore_closestfarm = saved.ore_closestfarm ForgeFlags.regional_ore_farm = saved.regional_ore_farm
+                    break
+                end
+            end
+        end
         local qid, idx, obj = PickQuestTarget()
         getgenv().forge_current_quest = qid
         if not qid or not obj then continue end
@@ -2603,7 +2705,16 @@ task.spawn(function()
                 end
             end
         elseif otype == "Kill" then
-            if ForgeFlags.auto_farm_objectives and type(target) == "string" and target ~= "" and target ~= "?" and target ~= "Any" then
+            if ForgeFlags.auto_farm_objectives and type(target) == "string" and target ~= "" and target ~= "?" then
+                if target == "Any" then
+                    -- generic kill-anything: closest mob farm
+                    if not ForgeFlags.mob_closestfarm then
+                        ForgeFlags.mob_closestfarm = true
+                        ForgeFlags.ore_autofarm = false ForgeFlags.ore_closestfarm = false ForgeFlags.regional_ore_farm = false
+                        if Toggles.ClosestMob then pcall(function() Toggles.ClosestMob:SetValue(true) end) end
+                        if Toggles.OreFarm then pcall(function() Toggles.OreFarm:SetValue(false) end) end
+                    end
+                else
                 -- drive mob farm to quest target (quest takes over mob selection)
                 local needSwitch = true
                 if #ForgeFlags.mobs_selected == 1 and ForgeFlags.mobs_selected[1] == target and ForgeFlags.mob_autofarm then needSwitch = false end
@@ -2617,6 +2728,7 @@ task.spawn(function()
                     if Toggles.OreFarm then pcall(function() Toggles.OreFarm:SetValue(false) end) end
                     if Toggles.ClosestOre then pcall(function() Toggles.ClosestOre:SetValue(false) end) end
                     if Toggles.RegionFarm then pcall(function() Toggles.RegionFarm:SetValue(false) end) end
+                end
                 end
             end
         elseif otype == "Mine" then
@@ -2635,9 +2747,16 @@ task.spawn(function()
                 end
             end
         elseif otype == "Collect" then
-            if ForgeFlags.auto_farm_objectives and type(target) == "string" and target ~= "" and target ~= "?" and target ~= "Ore" and target ~= "Any" then
-                -- ore collect: could be ore name or item (pickaxe etc - skip shop items)
-                if OreRarity[target] or OreRarity[BaseName(target)] then
+            if ForgeFlags.auto_farm_objectives and type(target) == "string" and target ~= "" and target ~= "?" then
+                if target == "Ore" or target == "Any" then
+                    -- generic mine-anything (e.g. Daily1 Collect Ore 100): closest ore farm
+                    if not ForgeFlags.ore_closestfarm then
+                        ForgeFlags.ore_closestfarm = true
+                        ForgeFlags.mob_autofarm = false ForgeFlags.mob_closestfarm = false
+                        if Toggles.ClosestOre then pcall(function() Toggles.ClosestOre:SetValue(true) end) end
+                        if Toggles.MobFarm then pcall(function() Toggles.MobFarm:SetValue(false) end) end
+                    end
+                elseif OreRarity[target] or OreRarity[BaseName(target)] then
                     local needSwitch = true
                     if #ForgeFlags.ores_selected == 1 and ForgeFlags.ores_selected[1] == target and ForgeFlags.ore_autofarm then needSwitch = false end
                     if needSwitch then
